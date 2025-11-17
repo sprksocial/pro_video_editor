@@ -80,12 +80,28 @@ public class ProVideoEditorPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
 
     case "renderVideo":
       guard let args = call.arguments as? [String: Any],
-        let id = args["id"] as? String,
-        let inputPath = args["inputPath"] as? String
+        let id = args["id"] as? String
       else {
         result(
           FlutterError(
             code: "INVALID_ARGUMENTS", message: "Missing parameters", details: nil))
+        return
+      }
+      
+      // Extract inputPath from top level or from first video clip
+      var inputPath: String?
+      if let topLevelInputPath = args["inputPath"] as? String {
+        inputPath = topLevelInputPath
+      } else if let videoClips = args["videoClips"] as? [[String: Any]],
+                let firstClip = videoClips.first,
+                let clipInputPath = firstClip["inputPath"] as? String {
+        inputPath = clipInputPath
+      }
+      
+      guard let inputPath = inputPath else {
+        result(
+          FlutterError(
+            code: "INVALID_ARGUMENTS", message: "Missing inputPath parameter", details: nil))
         return
       }
       
@@ -106,8 +122,32 @@ public class ProVideoEditorPlugin: NSObject, FlutterPlugin, FlutterStreamHandler
       let bitrate = args["bitrate"] as? Int
       let enableAudio = args["enableAudio"] as? Bool ?? true
       let playbackSpeed = (args["playbackSpeed"] as? NSNumber)?.floatValue
-      let startUs = args["startTime"] as? Int64
-      let endUs = args["endTime"] as? Int64
+      
+      // Extract startUs and endUs from top level or from first video clip
+      var startUs: Int64?
+      var endUs: Int64?
+      
+      // Check top level first (takes precedence)
+      if let topLevelStartUs = args["startTime"] as? Int64 {
+        startUs = topLevelStartUs
+      }
+      if let topLevelEndUs = args["endTime"] as? Int64 {
+        endUs = topLevelEndUs
+      }
+      
+      // If not found at top level, check first video clip
+      if startUs == nil || endUs == nil {
+        if let videoClips = args["videoClips"] as? [[String: Any]],
+           let firstClip = videoClips.first {
+          if startUs == nil, let clipStartUs = firstClip["startUs"] as? Int64 {
+            startUs = clipStartUs
+          }
+          if endUs == nil, let clipEndUs = firstClip["endUs"] as? Int64 {
+            endUs = clipEndUs
+          }
+        }
+      }
+      
       let colorMatrixList = args["colorMatrixList"] as? [[Double]] ?? []
       
       // Custom audio settings
