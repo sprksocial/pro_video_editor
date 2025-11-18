@@ -46,5 +46,7 @@ public func applyBitrate(requestedBitrate: Int?, presetHint: String? = nil) -> S
         }
     }
 
-    return presetHint ?? AVAssetExportPresetHighestQuality
+    // Default to MediumQuality for better performance when no bitrate is specified
+    // HighestQuality is slower and often unnecessary
+    return presetHint ?? AVAssetExportPresetMediumQuality
 }

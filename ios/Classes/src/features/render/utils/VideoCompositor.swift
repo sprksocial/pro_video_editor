@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import Metal
 import UIKit
 
 class VideoCompositor: NSObject, AVVideoCompositing {
@@ -86,10 +87,34 @@ class VideoCompositor: NSObject, AVVideoCompositing {
         }
     }
 
-    private let context = CIContext(options: [
-        .workingColorSpace: NSNull(),
-        .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-    ])
+    // Use Metal-backed CIContext for hardware acceleration and better performance
+    // Create a shared Metal device and context for optimal performance
+    private static let metalDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
+    private static let sharedContext: CIContext = {
+        var options: [CIContextOption: Any] = [
+            .workingColorSpace: NSNull(),
+            .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+        ]
+        
+        // Use Metal device directly for maximum performance
+        if let device = metalDevice {
+            options[.useSoftwareRenderer] = false
+            return CIContext(mtlDevice: device, options: options)
+        }
+        
+        return CIContext(options: options)
+    }()
+    
+    private var context: CIContext {
+        return Self.sharedContext
+    }
+    
+    // High-priority serial queue for frame processing
+    // AVFoundation manages concurrency, so we use serial queue to avoid blocking
+    private static let processingQueue = DispatchQueue(
+        label: "com.provideoeditor.compositor",
+        qos: .userInitiated
+    )
 
     var sourcePixelBufferAttributes: [String: any Sendable]? = [
         kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
@@ -102,143 +127,156 @@ class VideoCompositor: NSObject, AVVideoCompositing {
     func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {}
 
     func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
-        guard
-            let sourceBuffer = request.sourceFrame(byTrackID: request.sourceTrackIDs[0].int32Value)
-        else {
-            request.finish(with: NSError(domain: "VideoCompositor", code: 0))
-            return
-        }
-
-        var outputImage = CIImage(cvPixelBuffer: sourceBuffer)
-
-        if shouldApplyOrientationCorrection {
-            let correctionAngle: Double
-
-            switch Int(videoRotationDegrees.rounded()) {
-            case 90:
-                correctionAngle = -.pi / 2
-            case -90, 270:
-                correctionAngle = .pi / 2
-            case 180, -180:
-                correctionAngle = .pi
-            default:
-                correctionAngle = 0
+        // Process frames asynchronously to avoid blocking and improve performance
+        Self.processingQueue.async { [weak self] in
+            guard let self = self else {
+                request.finish(with: NSError(domain: "VideoCompositor", code: -1, userInfo: nil))
+                return
+            }
+            
+            guard
+                let sourceBuffer = request.sourceFrame(byTrackID: request.sourceTrackIDs[0].int32Value)
+            else {
+                request.finish(with: NSError(domain: "VideoCompositor", code: 0))
+                return
             }
 
-            if correctionAngle != 0 {
-                let correctionTransform = CGAffineTransform(rotationAngle: correctionAngle)
-                outputImage = outputImage.transformed(by: correctionTransform)
+            var outputImage = CIImage(cvPixelBuffer: sourceBuffer)
 
-                let transformedExtent = outputImage.extent
-                if transformedExtent.origin.x < 0 || transformedExtent.origin.y < 0 {
-                    let translation = CGAffineTransform(
-                        translationX: -transformedExtent.origin.x,
-                        y: -transformedExtent.origin.y
-                    )
-                    outputImage = outputImage.transformed(by: translation)
+            if self.shouldApplyOrientationCorrection {
+                let correctionAngle: Double
+
+                switch Int(self.videoRotationDegrees.rounded()) {
+                    case 90:
+                        correctionAngle = -.pi / 2
+                    case -90, 270:
+                        correctionAngle = .pi / 2
+                    case 180, -180:
+                        correctionAngle = .pi
+                    default:
+                        correctionAngle = 0
+                }
+
+                if correctionAngle != 0 {
+                    let correctionTransform = CGAffineTransform(rotationAngle: correctionAngle)
+                    outputImage = outputImage.transformed(by: correctionTransform)
+
+                    let transformedExtent = outputImage.extent
+                    if transformedExtent.origin.x < 0 || transformedExtent.origin.y < 0 {
+                        let translation = CGAffineTransform(
+                            translationX: -transformedExtent.origin.x,
+                            y: -transformedExtent.origin.y
+                        )
+                        outputImage = outputImage.transformed(by: translation)
+                    }
                 }
             }
-        }
 
-        var center = CGPoint(x: outputImage.extent.midX, y: outputImage.extent.midY)
+            var center = CGPoint(x: outputImage.extent.midX, y: outputImage.extent.midY)
 
-        // Transformations
-        var transform = CGAffineTransform.identity
+            // Transformations
+            var transform = CGAffineTransform.identity
 
-        // Cropping
-        if cropX != 0 || cropY != 0 || cropWidth != nil || cropHeight != nil {
-            let inputExtent = outputImage.extent
-            let videoWidth = inputExtent.width
-            let videoHeight = inputExtent.height
+            // Cropping
+            if self.cropX != 0 || self.cropY != 0 || self.cropWidth != nil || self.cropHeight != nil {
+                let inputExtent = outputImage.extent
+                let videoWidth = inputExtent.width
+                let videoHeight = inputExtent.height
 
-            let x = cropX
-            var y = cropY
-            let width = cropWidth ?? (videoWidth - x)
-            let height = cropHeight ?? (videoHeight - y)
+                let x = self.cropX
+                var y = self.cropY
+                let width = self.cropWidth ?? (videoWidth - x)
+                let height = self.cropHeight ?? (videoHeight - y)
 
-            y = videoHeight - height - y
+                y = videoHeight - height - y
 
-            let cropRect = CGRect(x: x, y: y, width: width, height: height)
+                let cropRect = CGRect(x: x, y: y, width: width, height: height)
 
-            outputImage = outputImage.cropped(to: cropRect)
-            outputImage = outputImage.transformed(
-                by: CGAffineTransform(
-                    translationX: -cropRect.origin.x,
-                    y: -cropRect.origin.y
-
-                ))
-            center = CGPoint(x: outputImage.extent.midX, y: outputImage.extent.midY)
-        }
-
-        // Rotation
-        if rotateRadians != 0 {
-            // Rotate the image
-            let rotation = CGAffineTransform(rotationAngle: rotateRadians)
-            let rotatedImage = outputImage.transformed(by: rotation)
-
-            // Get the new bounding box after rotation
-            let rotatedExtent = rotatedImage.extent
-
-            // Translate to (0, 0)
-            let translation = CGAffineTransform(
-                translationX: -rotatedExtent.origin.x, y: -rotatedExtent.origin.y)
-            outputImage = rotatedImage.transformed(by: translation)
-            center = CGPoint(x: outputImage.extent.midX, y: outputImage.extent.midY)
-        }
-
-        // Flipping
-        if flipX || flipY {
-            let scaleX: CGFloat = flipX ? -1 : 1
-            let scaleY: CGFloat = flipY ? -1 : 1
-
-            let flipTransform = CGAffineTransform(translationX: center.x, y: center.y)
-                .scaledBy(x: scaleX, y: scaleY)
-                .translatedBy(x: -center.x, y: -center.y)
-
-            transform = transform.concatenating(flipTransform)
-        }
-
-        // Apply Scale
-        if scaleX != 1 || scaleY != 1 {
-            transform = transform.scaledBy(x: scaleX, y: scaleY)
-        }
-
-        outputImage = outputImage.transformed(by: transform)
-
-        // Apply LUT
-        let (lutData, lutSize) = getLUT()
-        if let lutData,
-            let lutFilter = CIFilter(name: "CIColorCube")
-        {
-            lutFilter.setValue(lutSize, forKey: "inputCubeDimension")
-            lutFilter.setValue(lutData, forKey: "inputCubeData")
-            lutFilter.setValue(outputImage, forKey: kCIInputImageKey)
-            if let filteredImage = lutFilter.outputImage {
-                outputImage = filteredImage
+                outputImage = outputImage.cropped(to: cropRect)
+                outputImage = outputImage.transformed(
+                    by: CGAffineTransform(
+                        translationX: -cropRect.origin.x,
+                        y: -cropRect.origin.y
+                    ))
+                center = CGPoint(x: outputImage.extent.midX, y: outputImage.extent.midY)
             }
-        }
 
-        // Apply blur
-        if blurSigma > 0 {
-            outputImage = outputImage.applyingGaussianBlur(sigma: blurSigma)
-        }
+            // Rotation
+            if self.rotateRadians != 0 {
+                // Rotate the image
+                let rotation = CGAffineTransform(rotationAngle: self.rotateRadians)
+                let rotatedImage = outputImage.transformed(by: rotation)
 
-        // Apply overlay image
-        if let overlay = overlayImage {
-            let imageRect = outputImage.extent
-            let scaledOverlay = overlay.transformed(
-                by: CGAffineTransform(
-                    scaleX: imageRect.width / overlay.extent.width,
-                    y: imageRect.height / overlay.extent.height))
-            outputImage = scaledOverlay.composited(over: outputImage)
-        }
+                // Get the new bounding box after rotation
+                let rotatedExtent = rotatedImage.extent
 
-        guard let outputBuffer = request.renderContext.newPixelBuffer() else {
-            request.finish(with: NSError(domain: "VideoCompositor", code: -2, userInfo: nil))
-            return
-        }
+                // Translate to (0, 0)
+                let translation = CGAffineTransform(
+                    translationX: -rotatedExtent.origin.x, y: -rotatedExtent.origin.y)
+                outputImage = rotatedImage.transformed(by: translation)
+                center = CGPoint(x: outputImage.extent.midX, y: outputImage.extent.midY)
+            }
 
-        context.render(outputImage, to: outputBuffer)
-        request.finish(withComposedVideoFrame: outputBuffer)
+            // Flipping
+            if self.flipX || self.flipY {
+                let flipScaleX: CGFloat = self.flipX ? -1 : 1
+                let flipScaleY: CGFloat = self.flipY ? -1 : 1
+
+                let flipTransform = CGAffineTransform(translationX: center.x, y: center.y)
+                    .scaledBy(x: flipScaleX, y: flipScaleY)
+                    .translatedBy(x: -center.x, y: -center.y)
+
+                transform = transform.concatenating(flipTransform)
+            }
+
+            // Apply Scale
+            if self.scaleX != 1 || self.scaleY != 1 {
+                transform = transform.scaledBy(x: self.scaleX, y: self.scaleY)
+            }
+
+            outputImage = outputImage.transformed(by: transform)
+
+            // Apply LUT
+            let (lutData, lutSize) = self.getLUT()
+            if let lutData,
+                let lutFilter = CIFilter(name: "CIColorCube")
+            {
+                lutFilter.setValue(lutSize, forKey: "inputCubeDimension")
+                lutFilter.setValue(lutData, forKey: "inputCubeData")
+                lutFilter.setValue(outputImage, forKey: kCIInputImageKey)
+                if let filteredImage = lutFilter.outputImage {
+                    outputImage = filteredImage
+                }
+            }
+
+            // Apply blur
+            if self.blurSigma > 0 {
+                outputImage = outputImage.applyingGaussianBlur(sigma: self.blurSigma)
+            }
+
+            // Apply overlay image
+            if let overlay = self.overlayImage {
+                let imageRect = outputImage.extent
+                let scaledOverlay = overlay.transformed(
+                    by: CGAffineTransform(
+                        scaleX: imageRect.width / overlay.extent.width,
+                        y: imageRect.height / overlay.extent.height))
+                outputImage = scaledOverlay.composited(over: outputImage)
+            }
+
+            guard let outputBuffer = request.renderContext.newPixelBuffer() else {
+                request.finish(with: NSError(domain: "VideoCompositor", code: -2, userInfo: nil))
+                return
+            }
+
+            // Render with optimized context - use high quality interpolation for better results
+            self.context.render(
+                outputImage,
+                to: outputBuffer,
+                bounds: outputImage.extent,
+                colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+            )
+            request.finish(withComposedVideoFrame: outputBuffer)
+        }
     }
 }
