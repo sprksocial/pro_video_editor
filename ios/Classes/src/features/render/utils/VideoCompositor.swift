@@ -134,6 +134,21 @@ class VideoCompositor: NSObject, AVVideoCompositing {
                 return
             }
             
+            // Safety check: ensure we have at least one source track
+            guard !request.sourceTrackIDs.isEmpty else {
+                // No source tracks available for this frame - create empty frame or skip
+                if let outputBuffer = request.renderContext.newPixelBuffer() {
+                    request.finish(withComposedVideoFrame: outputBuffer)
+                } else {
+                    request.finish(with: NSError(
+                        domain: "VideoCompositor",
+                        code: -3,
+                        userInfo: [NSLocalizedDescriptionKey: "No source track IDs available"]
+                    ))
+                }
+                return
+            }
+            
             guard
                 let sourceBuffer = request.sourceFrame(byTrackID: request.sourceTrackIDs[0].int32Value)
             else {
